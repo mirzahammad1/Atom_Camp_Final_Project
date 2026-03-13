@@ -33,16 +33,28 @@ Subject:"""
 # =========================
 
 EMAIL_PATTERNS = [
+    # draft/write/compose email
     r"\bdraft\b.*\bemail\b",
     r"\bwrite\b.*\bemail\b",
     r"\bcompose\b.*\bemail\b",
+    r"\bmake\b.*\bemail\b",
+    r"\bgenerate\b.*\bemail\b",
+    r"\bhelp\b.*\bemail\b",
     r"\bemail\b.*\bdraft\b",
     r"\bemail\b.*\bto\b.*\b(professor|department|admin|registrar|dean|faculty|sir|ma'am|office)\b",
+    r"\bneed\b.*\bemail\b",
     r"\bsend\b.*\bemail\b",
+    r"\bi\b.*\bwant\b.*\bemail\b",
+    # letters and requests
     r"\bwrite\b.*\b(letter|request|complaint|application)\b",
     r"\bdraft\b.*\b(letter|request|complaint|application)\b",
+    r"\bmake\b.*\b(letter|request|complaint|application)\b",
+    r"\bgenerate\b.*\b(letter|request|complaint|application)\b",
+    # leave and applications
     r"\bapplication\b.*\b(leave|absence|extension|fee|scholarship|internship)\b",
     r"\bleave\b.*\b(application|request|letter)\b",
+    r"\bwrite\b.*\bto\b.*\b(professor|sir|madam|teacher|department|admin|dean)\b",
+    r"\bdraft\b.*\bto\b.*\b(professor|sir|madam|teacher|department|admin|dean)\b",
 ]
 
 
