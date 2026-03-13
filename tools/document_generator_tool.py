@@ -34,6 +34,8 @@ Document:"""
 DOCUMENT_PATTERNS = [
     r"\bgenerate\b.*\b(document|doc|letter|form|certificate|report|noc|slip|affidavit)\b",
     r"\bcreate\b.*\b(document|doc|letter|form|certificate|report|noc|slip)\b",
+    r"\bmake\b.*\b(document|doc|letter|form|certificate|report|noc|slip)\b",
+    r"\bprepare\b.*\b(document|doc|letter|form|certificate|report|noc|slip)\b",
     r"\bwrite\b.*\b(noc|no.?objection|bonafide|character certificate|experience letter)\b",
     r"\b(noc|no.?objection certificate)\b",
     r"\bbonafide\b",
@@ -41,7 +43,10 @@ DOCUMENT_PATTERNS = [
     r"\bexperience letter\b",
     r"\binternship letter\b",
     r"\brecommendation letter\b",
-    r"\b(generate|create|make|prepare|draft)\b.*\b(application form|request form)\b",
+    r"\b(generate|create|make|prepare|draft|write)\b.*\b(application form|request form)\b",
+    r"\bmake\b.*\bleave application\b",
+    r"\bneed\b.*\b(noc|certificate|bonafide|document|letter)\b",
+    r"\bi\b.*\bwant\b.*\b(noc|certificate|bonafide|document|letter)\b",
     r"\bfee\b.*\b(receipt|slip|document)\b",
     r"\bsemester\b.*\b(report|document|record)\b",
 ]
