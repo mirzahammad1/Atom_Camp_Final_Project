@@ -1,645 +1,295 @@
 from __future__ import annotations
 
+import re
 import time
 import logging
-from typing import Dict, List, Optional
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from agents.faq_agent import FAQAgent
-from agents.vectordb_agent import VectorDBAgent
-from agents.webscraper_agent import WebScraperAgent
-from agents.llm_agent import LLMAgent
-from agents.consistency_check_agent import ConsistencyCheckAgent
-from agents.summarizing_agent import SummarizingAgent
-from tools.email_draft_tool import EmailDraftTool
-from tools.document_generator_tool import DocumentGeneratorTool
-from tools.academic_info_tool import AcademicInfoTool
-from tools.response_log_agent import ResponseLogAgent
+from pymongo import MongoClient
+from rapidfuzz import fuzz
 
-logger = logging.getLogger("eduassist.orchestrator")
+logger = logging.getLogger("eduassist.faq_agent")
 
 
-# =========================
-# Intent Types
-# =========================
-INTENT_RAG      = "RAG"
-INTENT_ACTION   = "ACTION"
-INTENT_HYBRID   = "HYBRID"
-INTENT_SMALLTALK = "SMALLTALK"
-INTENT_FALLBACK = "FALLBACK"
+@dataclass(frozen=True)
+class FAQItem:
+    question: str
+    answer: str
+    norm_question: str
+    tokens: Tuple[str, ...]
 
 
-class OrchestratorAgent:
-    """
-    UniAssist+ Full Pipeline — Tool-Augmented Multi-Agent RAG System
+# ✅ Expanded smalltalk set — covers more common student greetings
+SMALLTALK_EXACT = {
+    "hi", "hello", "hey", "thanks", "thank you", "thankyou",
+    "ok", "okay", "k", "bye", "goodbye", "good morning",
+    "good afternoon", "good evening", "good night",
+    "sup", "yo", "wassup", "whatsup", "what's up",
+    "how are you", "how r u", "who are you", "what are you",
+    "nice", "cool", "great", "awesome", "perfect",
+    "hola", "salam", "assalam", "assalamualaikum",
+}
 
-    Intent Classification:
-      - SMALLTALK   → FAQ Agent (greetings, simple replies)
-      - ACTION      → Tool Layer (email draft / doc generator / academic info)
-      - HYBRID      → Tool + RAG context merged
-      - RAG         → Sequential RAG pipeline (FAQ → VECTOR → WEB → LLM)
+SMALLTALK_RESPONSES = [
+    "👋 Hello! I'm EDU Assist, your KIET university chatbot. Ask me anything about admissions, fees, programs, or events!",
+    "👋 Hi there! I'm EDU Assist. How can I help you with KIET university today?",
+    "👋 Hello! Happy to help. Ask me about KIET programs, fees, admissions, or anything else!",
+]
 
-    RAG Pipeline (8 steps):
-      [1] FAQ Agent       — MongoDB fuzzy + core-topic match
-      [2] VectorDB Agent  — FAISS semantic search (top-k chunks)
-      [3] WebScraper      — Live KIET website crawl
-      [4] LLM Agent       — Generates answer from merged chunks
-      [5] Consistency     — Hallucination detection + retry
-      [6] Summarizer      — Student-friendly bullet-point output
-      [7] Link Appender   — Appends relevant KIET links
-      [8] FAQ Storage     — Stores verified Q&A back to MongoDB
 
-    Tool Layer (Action Pipeline):
-      - Email Draft Tool         — Drafts formal emails
-      - Document Generator Tool  — Generates NOC, certificates, applications
-      - Academic Info Tool       — Simulated university data API
-
-    Response Logging:
-      - Every query+answer logged to MongoDB response_logs collection
-    """
-
-    LINK_KEYWORDS = {
-        "admission", "apply", "application", "form",
-        "last date", "closing date", "deadline", "eligibility",
-        "entry test", "merit", "apply now",
-        "program", "programs", "degree", "bachelor", "bs", "ms",
-        "courses", "department", "faculty",
-        "code jung", "event", "hackathon", "seminar", "workshop", "fest",
-        "fee", "fees", "scholarship", "financial",
-        "contact", "address", "location", "campus",
-        "website", "portal", "link", "page", "online",
-    }
-
-    FALLBACK_LINKS = {
-        "admission":    ("🎓 Admissions",            "https://admissions.kiet.edu.pk/"),
-        "apply":        ("🎓 Apply Online",           "https://kiet.edu.pk/apply"),
-        "eligibility":  ("📋 Admission Process",      "https://admissions.kiet.edu.pk/admission-process/"),
-        "requirement":  ("📋 Admission Process",      "https://admissions.kiet.edu.pk/admission-process/"),
-        "entry test":   ("📝 Aptitude Test Samples",  "https://admissions.kiet.edu.pk/sample-test-paper/"),
-        "aptitude":     ("📝 Aptitude Test Samples",  "https://admissions.kiet.edu.pk/sample-test-paper/"),
-        "last date":    ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "closing date": ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "deadline":     ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "schedule":     ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "merit":        ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "fee":          ("💰 Fee Structure",          "https://kiet.edu.pk/fee-structure/"),
-        "scholarship":  ("🏆 Scholarship & Discount", "https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
-        "discount":     ("🏆 Scholarship & Discount", "https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
-        "program":      ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
-        "courses":      ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
-        "bachelor":     ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
-        "degree":       ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
-        "software":     ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
-        "computer":     ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
-        "ai":           ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
-        "management":   ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
-        "mba":          ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
-        "bba":          ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
-        "event":        ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
-        "code jung":    ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
-        "hackathon":    ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
-        "seminar":      ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
-        "workshop":     ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
-        "portal":       ("🖥 Student LMS Portal",     "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
-        "lms":          ("🖥 Student LMS Portal",     "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
-        "transport":    ("🚌 Transport Services",      "https://kiet.edu.pk/services/students-transport-services/"),
-        "sports":       ("⚽ Sports Activities",       "https://kiet.edu.pk/sports-activities/"),
-        "alumni":       ("🤝 Alumni",                  "https://kiet.edu.pk/alumni/"),
-        "job":          ("💼 Jobs at KIET",            "https://kiet.edu.pk/jobs/"),
-        "contact":      ("📞 Departments Contact",    "https://kiet.edu.pk/departments-contact/"),
-        "address":      ("🗺 Route Map",               "https://kiet.edu.pk/route-map/"),
-        "location":     ("🗺 Route Map",               "https://kiet.edu.pk/route-map/"),
-        "calendar":     ("📆 Academic Calendar",       "https://kiet.edu.pk/academics/academic-calendar/"),
-        "faq":          ("❓ Admissions FAQs",          "https://kiet.edu.pk/faq/"),
-        "about":        ("🏫 About KIET",              "https://kiet.edu.pk/about/"),
-    }
-
+class FAQAgent:
     def __init__(
         self,
         mongo_uri: str,
         db_name: str,
         collection_name: str,
-        vector_path: str,
-        urls=None,
-        base_domain: Optional[str] = None,
         *,
-        faq_min_score: int = 82,
-        enable_smart_routing: bool = True,
-        enable_timing_logs: bool = False,
-        consistency_max_retries: int = 1,
-        debug: bool = False,
+        threshold: int = 70,
+        top_k: int = 5,
+        cache_ttl_seconds: int = 300,
     ):
-        # ── RAG Agents ──────────────────────────────
-        self.faq_agent = FAQAgent(mongo_uri, db_name, collection_name)
-        self.vector_agent = VectorDBAgent(vector_path)
-        self.webscraper_agent = WebScraperAgent(
-            urls=urls,
-            base_domain=base_domain or "kiet.edu.pk",
-        )
-        self.llm_agent = LLMAgent()
-        self.consistency_agent = ConsistencyCheckAgent(
-            self.llm_agent,
-            max_retries=consistency_max_retries,
-            enable_llm_verify=False,
-            debug=debug,
-        )
-        self.summarizing_agent = SummarizingAgent(self.llm_agent, debug=debug)
+        self.client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        self.collection = self.client[db_name][collection_name]
 
-        # ── Tool Layer ───────────────────────────────
-        self.email_tool        = EmailDraftTool(self.llm_agent)
-        self.document_tool     = DocumentGeneratorTool(self.llm_agent)
-        self.academic_info_tool = AcademicInfoTool()
+        self.threshold = int(threshold)
+        self.top_k = int(top_k)
+        self.cache_ttl_seconds = int(cache_ttl_seconds)
 
-        # ── Response Logger ──────────────────────────
-        self.response_log = ResponseLogAgent(mongo_uri, db_name)
+        self._cache: List[FAQItem] = []
+        self._cache_loaded_at: float = 0.0
+        self._cache_initialized: bool = False   # ✅ Sentinel flag — distinct from empty cache
 
-        # ── Config ───────────────────────────────────
-        self.faq_min_score        = int(faq_min_score)
-        self.enable_smart_routing = bool(enable_smart_routing)
-        self.enable_timing_logs   = bool(enable_timing_logs)
-        self.debug                = debug
+        # ✅ Thread-safety lock — prevents double-load in Streamlit's threaded env
+        self._cache_lock = threading.Lock()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Main Entry Point
-    # ══════════════════════════════════════════════════════════════════════════
+        # ✅ Rotating smalltalk response index
+        self._smalltalk_idx: int = 0
 
-    def answer(self, question: str) -> Dict[str, str]:
-        question = (question or "").strip()
-        if not question:
-            return self._fallback()
+    # ------------------ Public ------------------
 
-        t0 = time.perf_counter()
+    def answer(self, user_question: str) -> Optional[str]:
+        dbg = self.answer_with_debug(user_question)
+        return dbg["answer"] if dbg else None
 
-        # ── Step 1: Intent Classification ───────────
-        intent = self._classify_intent(question)
-        logger.info("🧠 Intent: %s | Query: '%s'", intent, question[:60])
-
-        result = None
-
-        # ── Step 2: Route by Intent ──────────────────
-        if intent == INTENT_ACTION:
-            result = self._run_tool_pipeline(question)
-
-        elif intent == INTENT_HYBRID:
-            result = self._run_hybrid_pipeline(question)
-
-        else:
-            # RAG (includes SMALLTALK via FAQ fast-path)
-            result = self._run_rag_pipeline(question, t0)
-
-        if result is None:
-            result = self._fallback()
-
-        # ── Step 3: Log response ─────────────────────
-        self.response_log.log(
-            query=question,
-            answer=result.get("answer", ""),
-            source=result.get("source", "Unknown"),
-            intent_type=intent,
-            consistency_passed=result.get("consistency_passed", "true").lower() == "true",
-            consistency_attempts=int(result.get("consistency_attempts", 0)),
-        )
-
-        if self.enable_timing_logs:
-            logger.info("⏱ Total: %.3fs | Intent: %s", time.perf_counter() - t0, intent)
-
-        return result
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Intent Classifier
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _classify_intent(self, question: str) -> str:
-        """
-        Classify user intent into one of:
-          ACTION   — email draft, document generation, academic API lookup
-          HYBRID   — action + context needed (e.g. "draft email about admission requirements")
-          RAG      — information retrieval (default)
-
-        Priority: ACTION > HYBRID > RAG
-        """
-        is_email    = EmailDraftTool.is_email_request(question)
-        is_document = DocumentGeneratorTool.is_document_request(question)
-        is_academic = AcademicInfoTool.is_academic_info_request(question)
-
-        # Pure action — directly invoke tool
-        if is_email or is_document:
-            return INTENT_ACTION
-
-        # Academic info tool — structured data, no RAG needed
-        if is_academic:
-            return INTENT_ACTION
-
-        # HYBRID: action keyword present but also needs contextual info
-        # e.g. "draft email asking about scholarship eligibility"
-        action_words = {"draft", "write", "compose", "generate", "create", "make", "prepare"}
-        info_words   = {"about", "regarding", "for", "related", "concerning"}
-        q_tokens     = set(question.lower().split())
-        if q_tokens & action_words and q_tokens & info_words:
-            # Has action + context bridge → hybrid
-            return INTENT_HYBRID
-
-        return INTENT_RAG
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Tool Pipeline (ACTION)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _run_tool_pipeline(self, question: str) -> Dict[str, str]:
-        """Route to the correct tool based on query type."""
-
-        # Email Draft Tool
-        if EmailDraftTool.is_email_request(question):
-            logger.info("🔧 Tool: EmailDraftTool")
-            result = self.email_tool.draft(question)
-            return {
-                "source": result.get("source", "Email Draft Tool"),
-                "answer": result.get("answer", ""),
-                "consistency_passed": "true",
-                "consistency_attempts": "0",
-            }
-
-        # Document Generator Tool
-        if DocumentGeneratorTool.is_document_request(question):
-            logger.info("🔧 Tool: DocumentGeneratorTool")
-            result = self.document_tool.generate(question)
-            return {
-                "source": result.get("source", "Document Generator Tool"),
-                "answer": result.get("answer", ""),
-                "consistency_passed": "true",
-                "consistency_attempts": "0",
-            }
-
-        # Academic Info Tool
-        if AcademicInfoTool.is_academic_info_request(question):
-            logger.info("🔧 Tool: AcademicInfoTool")
-            result = self.academic_info_tool.query(question)
-            return {
-                "source": result.get("source", "Academic Info Tool"),
-                "answer": result.get("answer", ""),
-                "consistency_passed": "true",
-                "consistency_attempts": "0",
-            }
-
-        # Fallback to RAG if tool match failed
-        logger.warning("ACTION intent but no tool matched — falling back to RAG")
-        return self._run_rag_pipeline(question, time.perf_counter())
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Hybrid Pipeline (ACTION + RAG context)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _run_hybrid_pipeline(self, question: str) -> Dict[str, str]:
-        """
-        Hybrid mode: retrieve context via RAG, then invoke tool with enriched query.
-
-        Example:
-            "draft email about admission requirements"
-            → RAG fetches admission requirements context
-            → EmailDraftTool drafts email using that context as additional info
-        """
-        logger.info("🔀 Hybrid pipeline: RAG context + Tool")
-
-        # Get RAG context first
-        rag_chunks = self._retrieve_chunks(question)
-        rag_context = ""
-        if rag_chunks:
-            rag_context = "\n\n".join(rag_chunks[:2])  # top 2 chunks as context
-
-        # Enrich the request with RAG context
-        enriched_request = question
-        if rag_context:
-            enriched_request = f"{question}\n\nContext for reference:\n{rag_context[:800]}"
-
-        # Route to tool with enriched request
-        if EmailDraftTool.is_email_request(question):
-            result = self.email_tool.draft(enriched_request)
-            source = "Hybrid (RAG + Email Draft Tool)"
-        elif DocumentGeneratorTool.is_document_request(question):
-            result = self.document_tool.generate(enriched_request)
-            source = "Hybrid (RAG + Document Generator Tool)"
-        else:
-            result = self.academic_info_tool.query(question)
-            source = "Hybrid (RAG + Academic Info Tool)"
-
-        return {
-            "source": source,
-            "answer": result.get("answer", ""),
-            "consistency_passed": "true",
-            "consistency_attempts": "0",
-        }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # RAG Pipeline
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _run_rag_pipeline(self, question: str, t0: float) -> Dict[str, str]:
-        timings: Dict[str, float] = {}
-
-        # Step 1: FAQ (fast path)
-        faq_result = self._timed("FAQ", timings, lambda: self._run_faq(question))
-        if faq_result is not None:
-            faq_result["answer"] = self._append_links(question, faq_result["answer"], [], "FAQ")
-            if self.enable_timing_logs:
-                self._log(["FAQ"], timings, time.perf_counter() - t0, "FAQ")
-            return faq_result
-
-        # Step 2: Retrieve chunks
-        order = self._decide_order(question)
-        chunk: Optional[List[str]] = None
-        chunk_source: Optional[str] = None
-
-        for name in order:
-            if name == "FAQ":
-                continue
-            result = self._timed(name, timings, lambda n=name: self._run_retriever(n, question))
-            if result:
-                chunk = result
-                chunk_source = name
-                logger.info("Retrieval success via %s (%d chunks)", name, len(chunk))
-                break
-
-        if not chunk:
-            logger.info("No chunks found for: '%s'", question[:60])
-            return self._fallback()
-
-        # Step 3: Extract URLs + strip Source: lines before LLM
-        source_urls = self._extract_source_urls(chunk)
-        clean_chunk = self._strip_source_lines(chunk)
-
-        # Step 4: LLM generation
-        t_llm = time.perf_counter()
-        raw_answer = self.llm_agent.generate(question=question, context=clean_chunk)
-        timings["LLM"] = time.perf_counter() - t_llm
-
-        if not raw_answer:
-            logger.warning("LLM returned empty answer.")
-            return self._fallback()
-
-        # Step 5: Consistency check
-        chunk_text = "\n\n".join(clean_chunk) if isinstance(clean_chunk, list) else clean_chunk
-        t_cc = time.perf_counter()
-        final_answer, passed, attempts = self.consistency_agent.check_and_fix(
-            question=question, answer=raw_answer, chunk=chunk_text,
-        )
-        timings["ConsistencyCheck"] = time.perf_counter() - t_cc
-        logger.info("Consistency check: passed=%s attempts=%d", passed, attempts)
-
-        # Step 6: Summarize
-        t_sum = time.perf_counter()
-        summarized = self.summarizing_agent.summarize(final_answer)
-        timings["Summarize"] = time.perf_counter() - t_sum
-
-        # Step 7: Append links
-        summarized = self._append_links(question, summarized, source_urls, chunk_source)
-
-        # Step 8: Store to FAQ
-        self._store_to_faq(question, summarized)
-
-        if self.enable_timing_logs:
-            self._log(
-                order + ["LLM", "ConsistencyCheck", "Summarize"],
-                timings, time.perf_counter() - t0, chunk_source or "Unknown"
-            )
-
-        return {
-            "source": f"{chunk_source} Agent -> LLM",
-            "answer": summarized,
-            "consistency_passed": str(passed),
-            "consistency_attempts": str(attempts),
-        }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Chunk Retrieval (shared by RAG + Hybrid)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _retrieve_chunks(self, question: str) -> Optional[List[str]]:
-        """Retrieve chunks without running the full RAG pipeline."""
-        order = self._decide_order(question)
-        for name in order:
-            if name == "FAQ":
-                continue
-            result = self._run_retriever(name, question)
-            if result:
-                return result
-        return None
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Retrieval Runners
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _run_faq(self, question: str) -> Optional[Dict[str, str]]:
-        try:
-            dbg = self.faq_agent.answer_with_debug(question)
-            if dbg and int(dbg.get("score", 0) or 0) >= self.faq_min_score:
-                ans = str(dbg.get("answer", "")).strip()
-                if ans:
-                    return {
-                        "source": "FAQ Agent",
-                        "answer": ans,
-                        "consistency_passed": "true",
-                        "consistency_attempts": "0",
-                    }
-        except Exception as e:
-            logger.warning("FAQ agent error: %s", e)
-        return None
-
-    def _run_retriever(self, name: str, question: str) -> Optional[List[str]]:
-        try:
-            if name == "VECTOR":
-                result = self.vector_agent.search(question)
-            elif name == "WEB":
-                result = self.webscraper_agent.scrape(question)
-            else:
-                return None
-
-            if isinstance(result, list):
-                chunks = [c for c in result if isinstance(c, str) and c.strip()]
-                return chunks if chunks else None
-            if isinstance(result, str) and result.strip():
-                return [result.strip()]
+    def answer_with_debug(self, user_question: str) -> Optional[Dict[str, Any]]:
+        user_question = (user_question or "").strip()
+        if not user_question:
             return None
 
-        except Exception as e:
-            logger.warning("%s retriever error: %s", name, e)
+        # ✅ Smalltalk → return friendly greeting immediately
+        # Avoids wasteful fallthrough through all 6 pipeline agents
+        if self._looks_like_smalltalk(user_question):
+            response = SMALLTALK_RESPONSES[self._smalltalk_idx % len(SMALLTALK_RESPONSES)]
+            self._smalltalk_idx += 1
+            return {
+                "answer": response,
+                "score": 100,
+                "matched_question": "__smalltalk__",
+            }
+
+        faqs = self._get_cached_faqs()
+        if not faqs:
+            return None
+
+        norm_q = self._normalize(user_question)
+        q_tokens = set(self._tokenize(norm_q))
+
+        scored: List[Tuple[int, FAQItem]] = []
+        for item in faqs:
+            score = int(fuzz.token_set_ratio(norm_q, item.norm_question))
+            scored.append((score, item))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            return None
+
+        candidates = scored[: max(1, self.top_k)]
+        best_score, best_item = self._tie_break(candidates, q_tokens)
+
+        if best_score >= self.threshold:
+            # ✅ FIX 1: Topic mismatch guard
+            # Even if score is high, reject if key topic words don't overlap
+            # Prevents "tell me about code jung" matching "Dr. Abdullah" FAQ entry
+            if not self._topic_words_overlap(norm_q, best_item.norm_question):
+                logger.info(
+                    "FAQ rejected (topic mismatch): score=%d query='%s' matched='%s'",
+                    best_score, norm_q[:50], best_item.norm_question[:50],
+                )
+                return None
+
+            logger.info(
+                "FAQ hit: score=%d matched='%s'",
+                best_score, best_item.question[:60],
+            )
+            return {
+                "answer": best_item.answer,
+                "score": best_score,
+                "matched_question": best_item.question,
+            }
+
+        logger.debug("FAQ miss: best_score=%d < threshold=%d", best_score, self.threshold)
         return None
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # URL Extraction & Link Appending
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _extract_source_urls(self, chunks: List[str]) -> List[str]:
-        urls: List[str] = []
-        seen: set = set()
-        for chunk in chunks:
-            for line in chunk.splitlines():
-                line = line.strip()
-                if line.lower().startswith("source:"):
-                    url = line.split(":", 1)[1].strip()
-                    if url.startswith("//"):
-                        url = "https:" + url
-                    if url not in seen and url.startswith("http"):
-                        seen.add(url)
-                        urls.append(url)
-        return urls
-
-    def _strip_source_lines(self, chunks: List[str]) -> List[str]:
-        cleaned: List[str] = []
-        for chunk in chunks:
-            kept = [
-                line for line in chunk.splitlines()
-                if not line.strip().lower().startswith("source:")
-            ]
-            cleaned.append("\n".join(kept).strip())
-        return cleaned
-
-    def _is_link_worthy(self, question: str) -> bool:
-        q = question.lower()
-        return any(kw in q for kw in self.LINK_KEYWORDS)
-
-    def _get_fallback_links(self, question: str) -> List[tuple]:
-        q = question.lower()
-        seen_urls: set = set()
-        links: List[tuple] = []
-        for kw, (label, url) in self.FALLBACK_LINKS.items():
-            if kw in q and url not in seen_urls:
-                seen_urls.add(url)
-                links.append((label, url))
-        return links[:2]
-
-    def _append_links(
-        self,
-        question: str,
-        answer: str,
-        source_urls: List[str],
-        chunk_source: Optional[str],
-    ) -> str:
-        if not self._is_link_worthy(question):
-            return answer
-        if "contact the University directly" in answer:
-            return answer
-        if "not available in the current data" in answer:
-            return answer
-
-        link_lines: List[str] = []
-
-        if source_urls and chunk_source == "WEB":
-            link_lines.append("\n\U0001f517 *Relevant Links:*")
-            for url in source_urls[:2]:
-                link_lines.append("   \u2022 " + url)
-        else:
-            fallbacks = self._get_fallback_links(question)
-            if fallbacks:
-                link_lines.append("\n\U0001f517 *Useful Links:*")
-                for label, url in fallbacks:
-                    link_lines.append("   \u2022 " + label + ": " + url)
-
-        if link_lines:
-            return answer + "\n" + "\n".join(link_lines)
-        return answer
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # FAQ Storage
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _store_to_faq(self, question: str, answer: str) -> None:
-        if not question or not answer:
-            return
-        if answer.strip() == self._fallback()["answer"].strip():
-            return
-        if "not available in the current data" in answer.lower():
-            return
-        if len(answer.strip()) < 30:
-            return
-
-        try:
-            existing = self.faq_agent.collection.find_one(
-                {"question": question.strip()}, {"_id": 1}
-            )
-            if existing:
-                return
-            self.faq_agent.collection.insert_one(
-                {"question": question.strip(), "answer": answer.strip()}
-            )
-            self.faq_agent._cache = []
-            self.faq_agent._cache_loaded_at = 0.0
-            self.faq_agent._cache_initialized = False
-            logger.info("Stored new FAQ entry: '%s'", question[:60])
-        except Exception as e:
-            logger.warning("FAQ store error: %s", e)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Smart Routing
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _decide_order(self, question: str) -> List[str]:
-        base = ["FAQ", "VECTOR", "WEB"]
-        if not self.enable_smart_routing:
-            return base
-
-        q = question.lower()
-
-        time_sensitive = any(k in q for k in [
-            "latest", "recent", "updated", "notice", "announcement",
-            "deadline", "timetable", "schedule", "merit list",
-            "result", "today", "this week", "new",
-            "last date", "closing date", "due date", "last day",
-            "when is", "when are", "when does", "when will",
-            "open now", "currently", "this year", "2025", "2026",
-            "admission date", "apply by", "submission date",
-        ])
-        if time_sensitive:
-            logger.info("Smart routing: time-sensitive -> WEB first")
-            return ["FAQ", "WEB", "VECTOR"]
-
-        web_first = any(k in q for k in [
-            "event", "competition", "fest", "code jung", "hackathon",
-            "seminar", "workshop", "expo", "tech fest", "gaming",
-            "how many", "list of", "all programs", "all courses",
-            "programs offering", "programs offered", "kiet offering",
-            "bachelor", "bachelors", "bs programs", "ms programs",
-            "degree", "courses offered", "what programs",
-            "admission", "apply", "eligibility", "requirement",
-            "merit", "entry test", "form", "apply online",
-        ])
-        if web_first:
-            logger.info("Smart routing: web-first query -> WEB before VECTOR")
-            return ["FAQ", "WEB", "VECTOR"]
-
-        return base
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Helpers
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _timed(self, name: str, timings: dict, fn):
-        start = time.perf_counter()
-        result = fn()
-        timings[name] = time.perf_counter() - start
-        return result
-
-    def _fallback(self) -> Dict[str, str]:
-        return {
-            "source": "None",
-            "answer": (
-                "I'm sorry, I couldn't find information on that.\n"
-                "Please contact the University directly:\n"
-                "\u2022 \U0001f4de Phone: 02136628381 / 02136679314\n"
-                "\u2022 \U0001f4e7 Email: admissions@kiet.edu.pk"
-            ),
-            "consistency_passed": "true",
-            "consistency_attempts": "0",
-        }
-
-    def _log(self, order, timings, total, chosen):
-        parts = " | ".join([f"{k}={timings.get(k, 0):.3f}s" for k in order])
-        logger.info("\u23f1 chosen=%s total=%.3fs | %s", chosen, total, parts)
 
     def close(self) -> None:
         try:
-            self.faq_agent.close()
+            self.client.close()
         except Exception:
             pass
+
+    # ------------------ Cache / Load ------------------
+
+    def _get_cached_faqs(self) -> List[FAQItem]:
+        now = time.time()
+
+        # ✅ Fast path — cache loaded and still fresh
+        if self._cache_initialized and (now - self._cache_loaded_at) < self.cache_ttl_seconds:
+            return self._cache
+
+        # ✅ Slow path — acquire lock before reloading
+        with self._cache_lock:
+            # Double-check inside lock using sentinel flag (not list truthiness)
+            # This correctly handles the case where MongoDB returns 0 docs
+            if self._cache_initialized and (now - self._cache_loaded_at) < self.cache_ttl_seconds:
+                return self._cache
+
+            self._cache = self._load_from_mongo()
+            self._cache_loaded_at = time.time()
+            self._cache_initialized = True   # ✅ Mark as loaded regardless of result
+            logger.info("FAQ cache refreshed: %d entries loaded.", len(self._cache))
+
+        return self._cache
+
+    def _load_from_mongo(self) -> List[FAQItem]:
+        items: List[FAQItem] = []
         try:
-            self.response_log.close()
-        except Exception:
-            pass
+            docs = list(self.collection.find({}, {"_id": 0}))
+        except Exception as e:
+            logger.error("MongoDB load error: %s", e)
+            return items
+
+        raw: List[Dict[str, Any]] = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            if isinstance(doc.get("faqs"), list):
+                raw.extend([x for x in doc["faqs"] if isinstance(x, dict)])
+            elif "question" in doc and "answer" in doc:
+                raw.append(doc)
+
+        for f in raw:
+            q = f.get("question")
+            a = f.get("answer")
+            if not isinstance(q, str) or not isinstance(a, str):
+                continue
+            q = q.strip()
+            a = a.strip()
+            if not q or not a:
+                continue
+            nq = self._normalize(q)
+            items.append(
+                FAQItem(
+                    question=q,
+                    answer=a,
+                    norm_question=nq,
+                    tokens=self._tokenize(nq),
+                )
+            )
+
+        return items
+
+    # ------------------ Ranking ------------------
+
+    def _tie_break(
+        self, candidates: List[Tuple[int, FAQItem]], q_tokens: set
+    ) -> Tuple[int, FAQItem]:
+        best_score, _ = candidates[0]
+        close = [c for c in candidates if (best_score - c[0]) <= 3]
+        if len(close) <= 1:
+            return candidates[0]
+
+        def overlap(item: FAQItem) -> int:
+            return len(q_tokens.intersection(item.tokens))
+
+        close.sort(
+            key=lambda x: (x[0], overlap(x[1]), len(x[1].tokens), len(x[1].question)),
+            reverse=True,
+        )
+        return close[0][0], close[0][1]
+
+    # ------------------ Text utils ------------------
+
+    _punct_re = re.compile(r"[^\w\s]", flags=re.UNICODE)
+    _space_re = re.compile(r"\s+", flags=re.UNICODE)
+
+    def _normalize(self, text: str) -> str:
+        text = (text or "").lower().strip()
+        text = self._punct_re.sub(" ", text)
+        text = self._space_re.sub(" ", text).strip()
+        return text
+
+    def _tokenize(self, norm_text: str) -> Tuple[str, ...]:
+        return tuple(t for t in norm_text.split() if t)
+
+    def _topic_words_overlap(self, query_norm: str, faq_norm: str) -> bool:
+        """
+        ✅ Topic overlap guard — prevents false FAQ matches.
+        Rejects a FAQ match if the main topic words of the query
+        don't appear in the matched FAQ question at all.
+
+        Example:
+            query = "tell me about code jung"
+            faq   = "tell me about dr abdullah qualifications"
+            → topic words of query: {"code", "jung"}
+            → none found in faq → REJECT
+
+        Only applies when query has meaningful topic words (nouns/names).
+        Skips common words like "tell", "about", "what", "is", "the".
+        """
+        # Words to ignore (stop words)
+        stop_words = {
+            "tell", "me", "about", "what", "is", "are", "the", "a", "an",
+            "how", "many", "does", "do", "kiet", "university", "please",
+            "can", "you", "i", "want", "know", "give", "provide", "show",
+            "get", "find", "explain", "describe", "list", "all", "any",
+            "have", "has", "had", "will", "would", "could", "should",
+            "its", "their", "there", "which", "who", "when", "where",
+        }
+
+        query_tokens = set(self._tokenize(query_norm)) - stop_words
+        faq_tokens = set(self._tokenize(faq_norm)) - stop_words
+
+        # If query has no meaningful topic words, skip the check
+        if not query_tokens:
+            return True
+
+        # At least 1 topic word must overlap
+        overlap = query_tokens & faq_tokens
+        has_overlap = len(overlap) >= 1
+
+        if not has_overlap:
+            logger.debug(
+                "Topic mismatch: query_topics=%s faq_topics=%s",
+                query_tokens, faq_tokens
+            )
+
+        return has_overlap
+
+    def _looks_like_smalltalk(self, text: str) -> bool:
+        norm = self._normalize(text)
+
+        # Exact match
+        if norm in SMALLTALK_EXACT:
+            return True
+
+        # Very short input (1-2 chars)
+        if len(norm) <= 2:
+            return True
+
+        # ✅ Fuzzy match against smalltalk set for typos like "helo", "thankss"
+        for phrase in SMALLTALK_EXACT:
+            if len(phrase) > 3 and fuzz.ratio(norm, phrase) >= 88:
+                return True
+
+        return False
