@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 import logging
 from typing import Dict, List, Optional
@@ -11,25 +12,124 @@ from agents.llm_agent import LLMAgent
 from agents.consistency_check_agent import ConsistencyCheckAgent
 from agents.summarizing_agent import SummarizingAgent
 
+# ── Tool Layer ────────────────────────────────────────────────────────────────
+from tools.email_draft_tool import EmailDraftTool
+from tools.document_generator_tool import DocumentGeneratorTool
+from tools.academic_info_tool import AcademicInfoTool
+from agents.response_log_agent import ResponseLogAgent
+
 logger = logging.getLogger("eduassist.orchestrator")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Intent constants
+# ══════════════════════════════════════════════════════════════════════════════
+INTENT_RAG    = "RAG"
+INTENT_ACTION = "ACTION"
+INTENT_HYBRID = "HYBRID"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Email patterns  (checked FIRST — highest priority)
+# ══════════════════════════════════════════════════════════════════════════════
+_EMAIL_PATTERNS = [
+    r"\bdraft\b.*\bemail\b",
+    r"\bwrite\b.*\bemail\b",
+    r"\bcompose\b.*\bemail\b",
+    r"\bmake\b.*\bemail\b",
+    r"\bgenerate\b.*\bemail\b",
+    r"\bhelp\b.*\bemail\b",
+    r"\bneed\b.*\bemail\b",
+    r"\bsend\b.*\bemail\b",
+    r"\bemail\b.*\bdraft\b",
+    r"\bemail\b.*\bto\b.*\b(professor|department|admin|registrar|dean|faculty|sir|madam|office)\b",
+    r"\bi\b.*\bwant\b.*\bemail\b",
+    r"\bwrite\b.*\b(letter|request|complaint|application)\b",
+    r"\bdraft\b.*\b(letter|request|complaint|application)\b",
+    r"\bmake\b.*\b(letter|request|complaint|application)\b",
+    r"\bgenerate\b.*\b(letter|request|complaint|application)\b",
+    r"\bapplication\b.*\b(leave|absence|extension|fee|scholarship|internship)\b",
+    r"\bleave\b.*\b(application|request|letter)\b",
+    r"\bwrite\b.*\bto\b.*\b(professor|sir|madam|teacher|department|admin|dean)\b",
+    r"\bdraft\b.*\bto\b.*\b(professor|sir|madam|teacher|department|admin|dean)\b",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Document patterns
+# ══════════════════════════════════════════════════════════════════════════════
+_DOCUMENT_PATTERNS = [
+    r"\bgenerate\b.*\b(document|doc|certificate|report|noc|slip|affidavit)\b",
+    r"\bcreate\b.*\b(document|doc|certificate|report|noc|slip)\b",
+    r"\bmake\b.*\b(document|doc|certificate|report|noc|slip)\b",
+    r"\bprepare\b.*\b(document|doc|certificate|report|noc|slip)\b",
+    r"\bdraft\b.*\b(noc|bonafide|character certificate|experience letter|internship letter|recommendation)\b",
+    r"\bwrite\b.*\b(noc|bonafide|character certificate|experience letter|internship letter|recommendation)\b",
+    r"\b(noc|no.?objection certificate)\b",
+    r"\bbonafide\b",
+    r"\bcharacter certificate\b",
+    r"\bexperience letter\b",
+    r"\binternship letter\b",
+    r"\brecommendation letter\b",
+    r"\b(generate|create|make|prepare|draft|write)\b.*\b(application form|request form)\b",
+    r"\bmake\b.*\bleave application\b",
+    r"\bneed\b.*\b(noc|certificate|bonafide|internship letter|recommendation)\b",
+    r"\bi\b.*\bwant\b.*\b(noc|certificate|bonafide|document)\b",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Academic info patterns
+# ══════════════════════════════════════════════════════════════════════════════
+_ACADEMIC_PATTERNS = [
+    r"\bfee structure\b",
+    r"\b(fee|fees)\b.*\b(structure|detail|breakdown|semester|total)\b",
+    r"\bgrading scale\b",
+    r"\bgpa scale\b",
+    r"\b(grading|grade)\b.*\b(policy|system|scale|criteria)\b",
+    r"\bacademic calendar\b",
+    r"\bsemester schedule\b",
+    r"\badmission requirements\b",
+    r"\beligibility criteria\b",
+    r"\b(admission|admissions)\b.*\b(requirement|process|document|eligibility|criteria)\b",
+    r"\b(requirement|requirements)\b.*\b(admission|apply|applying)\b",
+    r"\bdocuments?\b.*\b(required|needed|admission|apply)\b",
+    r"\bwhat programs\b",
+    r"\ball programs\b",
+    r"\blist of programs\b",
+    r"\bprograms?\b.*\b(offer|available|kiet|list)\b",
+    r"\b(what|list|show)\b.*\b(program|programs|degree|degrees)\b.*\b(offer|available|kiet)\b",
+    r"\bhow many\b.*\b(program|degree|course|semester|credit)\b",
+    r"\bkiet\b.*\b(facilities|hostel|transport|sports|library)\b",
+    r"\b(hostel|transport|library|lab|sports)\b.*\b(detail|info|available|fee|cost)\b",
+    r"\b(credit hours?|total credits?)\b",
+    r"\b(check|show|get|find|view)\b.*\b(cgpa|gpa|grade|marks|result)\b",
+    r"\b(gpa|cgpa)\b.*\b(calculat|compute)\b",
+]
+
+
+def _match(patterns: List[str], text: str) -> bool:
+    """Return True if text matches any pattern (case-insensitive)."""
+    t = text.lower()
+    return any(re.search(p, t) for p in patterns)
 
 
 class OrchestratorAgent:
     """
-    Full 8-step RAG pipeline for EDU Assist:
-      [1] FAQ Agent       — MongoDB fuzzy + core-topic match
-      [2] VectorDB Agent  — FAISS semantic search (top-3 chunks)
-      [3] WebScraper      — Live KIET website crawl (top-3 chunks)
-      [4] LLM Agent       — Generates answer from merged chunks
-      [5] Consistency     — Hallucination detection + retry
-      [6] Summarizer      — Student-friendly bullet-point output
-      [7] Link Appender   — Appends relevant KIET links
-      [8] FAQ Storage     — Stores verified Q&A back to MongoDB
+    UniAssist+ — Tool-Augmented Multi-Agent RAG System
 
-    Smart routing:
-      - Time-sensitive / admission date queries  → WEB first
-      - Program / event / admission queries      → WEB first
-      - All others                               → VECTOR first
+    Intent Classification (checked before RAG pipeline):
+      ACTION  → Email Draft Tool / Document Generator / Academic Info Tool
+      HYBRID  → RAG context fetch first, then tool with enriched request
+      RAG     → Full 8-step RAG pipeline (FAQ → VECTOR → WEB → LLM → ...)
+
+    RAG Pipeline (8 steps):
+      [1] FAQ Agent       — MongoDB fuzzy match
+      [2] Smart Routing   — Decides VECTOR-first or WEB-first
+      [3] VectorDB Agent  — FAISS semantic search
+      [4] WebScraper      — Live KIET website crawl
+      [5] LLM Agent       — Generates answer from merged chunks
+      [6] Consistency     — Hallucination detection + retry
+      [7] Summarizer      — Student-friendly bullet-point output
+      [8] Link Appender + FAQ Storage
     """
 
     LINK_KEYWORDS = {
@@ -45,53 +145,47 @@ class OrchestratorAgent:
     }
 
     FALLBACK_LINKS = {
-        # Admissions
-        "admission":    ("🎓 Admissions",           "https://admissions.kiet.edu.pk/"),
-        "apply":        ("🎓 Apply Online",          "https://kiet.edu.pk/apply"),
-        "eligibility":  ("📋 Admission Process",     "https://admissions.kiet.edu.pk/admission-process/"),
-        "requirement":  ("📋 Admission Process",     "https://admissions.kiet.edu.pk/admission-process/"),
-        "entry test":   ("📝 Aptitude Test Samples", "https://admissions.kiet.edu.pk/sample-test-paper/"),
-        "aptitude":     ("📝 Aptitude Test Samples", "https://admissions.kiet.edu.pk/sample-test-paper/"),
-        "last date":    ("📅 Admission Schedule",    "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "closing date": ("📅 Admission Schedule",    "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "deadline":     ("📅 Admission Schedule",    "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "schedule":     ("📅 Admission Schedule",    "https://admissions.kiet.edu.pk/admission-schedule/"),
-        "merit":        ("📅 Admission Schedule",    "https://admissions.kiet.edu.pk/admission-schedule/"),
-        # Fee & Scholarship
-        "fee":          ("💰 Fee Structure",         "https://kiet.edu.pk/fee-structure/"),
-        "scholarship":  ("🏆 Scholarship & Discount","https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
-        "discount":     ("🏆 Scholarship & Discount","https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
-        # Programs
-        "program":      ("📚 All Programs",          "https://kiet.edu.pk/programs/"),
-        "courses":      ("📚 All Programs",          "https://kiet.edu.pk/programs/"),
-        "bachelor":     ("📚 All Programs",          "https://kiet.edu.pk/programs/"),
-        "degree":       ("📚 All Programs",          "https://kiet.edu.pk/programs/"),
-        "software":     ("💻 COCIS Faculty",         "https://cocis.kiet.edu.pk/"),
-        "computer":     ("💻 COCIS Faculty",         "https://cocis.kiet.edu.pk/"),
-        "ai":           ("💻 COCIS Faculty",         "https://cocis.kiet.edu.pk/"),
-        "management":   ("💼 COMS Faculty",          "https://coms.kiet.edu.pk/"),
-        "mba":          ("💼 COMS Faculty",          "https://coms.kiet.edu.pk/"),
-        "bba":          ("💼 COMS Faculty",          "https://coms.kiet.edu.pk/"),
-        # Events
-        "event":        ("📅 Events & News",         "https://kiet.edu.pk/events-news/"),
-        "code jung":    ("📅 Events & News",         "https://kiet.edu.pk/events-news/"),
-        "hackathon":    ("📅 Events & News",         "https://kiet.edu.pk/events-news/"),
-        "seminar":      ("📅 Events & News",         "https://kiet.edu.pk/events-news/"),
-        "workshop":     ("📅 Events & News",         "https://kiet.edu.pk/events-news/"),
-        # Student
-        "portal":       ("🖥 Student LMS Portal",    "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
-        "lms":          ("🖥 Student LMS Portal",    "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
-        "transport":    ("🚌 Transport Services",     "https://kiet.edu.pk/services/students-transport-services/"),
-        "sports":       ("⚽ Sports Activities",          "https://kiet.edu.pk/sports-activities/"),
-        "alumni":       ("🤝 Alumni",                 "https://kiet.edu.pk/alumni/"),
-        "job":          ("💼 Jobs at KIET",           "https://kiet.edu.pk/jobs/"),
-        # Contact & Info
-        "contact":      ("📞 Departments Contact",   "https://kiet.edu.pk/departments-contact/"),
-        "address":      ("🗺 Route Map",              "https://kiet.edu.pk/route-map/"),
-        "location":     ("🗺 Route Map",              "https://kiet.edu.pk/route-map/"),
-        "calendar":     ("📆 Academic Calendar",      "https://kiet.edu.pk/academics/academic-calendar/"),
-        "faq":          ("❓ Admissions FAQs",            "https://kiet.edu.pk/faq/"),
-        "about":        ("🏫 About KIET",             "https://kiet.edu.pk/about/"),
+        "admission":    ("🎓 Admissions",            "https://admissions.kiet.edu.pk/"),
+        "apply":        ("🎓 Apply Online",           "https://kiet.edu.pk/apply"),
+        "eligibility":  ("📋 Admission Process",      "https://admissions.kiet.edu.pk/admission-process/"),
+        "requirement":  ("📋 Admission Process",      "https://admissions.kiet.edu.pk/admission-process/"),
+        "entry test":   ("📝 Aptitude Test Samples",  "https://admissions.kiet.edu.pk/sample-test-paper/"),
+        "aptitude":     ("📝 Aptitude Test Samples",  "https://admissions.kiet.edu.pk/sample-test-paper/"),
+        "last date":    ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
+        "closing date": ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
+        "deadline":     ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
+        "schedule":     ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
+        "merit":        ("📅 Admission Schedule",     "https://admissions.kiet.edu.pk/admission-schedule/"),
+        "fee":          ("💰 Fee Structure",          "https://kiet.edu.pk/fee-structure/"),
+        "scholarship":  ("🏆 Scholarship & Discount", "https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
+        "discount":     ("🏆 Scholarship & Discount", "https://admissions.kiet.edu.pk/scholarship-fee-discount/"),
+        "program":      ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
+        "courses":      ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
+        "bachelor":     ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
+        "degree":       ("📚 All Programs",           "https://kiet.edu.pk/programs/"),
+        "software":     ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
+        "computer":     ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
+        "ai":           ("💻 COCIS Faculty",          "https://cocis.kiet.edu.pk/"),
+        "management":   ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
+        "mba":          ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
+        "bba":          ("💼 COMS Faculty",           "https://coms.kiet.edu.pk/"),
+        "event":        ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
+        "code jung":    ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
+        "hackathon":    ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
+        "seminar":      ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
+        "workshop":     ("📅 Events & News",          "https://kiet.edu.pk/events-news/"),
+        "portal":       ("🖥 Student LMS Portal",     "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
+        "lms":          ("🖥 Student LMS Portal",     "https://lms.kiet.edu.pk/kietlms/my/Student_Portal.php"),
+        "transport":    ("🚌 Transport Services",      "https://kiet.edu.pk/services/students-transport-services/"),
+        "sports":       ("⚽ Sports Activities",       "https://kiet.edu.pk/sports-activities/"),
+        "alumni":       ("🤝 Alumni",                  "https://kiet.edu.pk/alumni/"),
+        "job":          ("💼 Jobs at KIET",            "https://kiet.edu.pk/jobs/"),
+        "contact":      ("📞 Departments Contact",    "https://kiet.edu.pk/departments-contact/"),
+        "address":      ("🗺 Route Map",               "https://kiet.edu.pk/route-map/"),
+        "location":     ("🗺 Route Map",               "https://kiet.edu.pk/route-map/"),
+        "calendar":     ("📆 Academic Calendar",       "https://kiet.edu.pk/academics/academic-calendar/"),
+        "faq":          ("❓ Admissions FAQs",          "https://kiet.edu.pk/faq/"),
+        "about":        ("🏫 About KIET",              "https://kiet.edu.pk/about/"),
     }
 
     def __init__(
@@ -109,6 +203,7 @@ class OrchestratorAgent:
         consistency_max_retries: int = 1,
         debug: bool = False,
     ):
+        # ── RAG Agents ────────────────────────────────────────────────────────
         self.faq_agent = FAQAgent(mongo_uri, db_name, collection_name)
         self.vector_agent = VectorDBAgent(vector_path)
         self.webscraper_agent = WebScraperAgent(
@@ -124,14 +219,21 @@ class OrchestratorAgent:
         )
         self.summarizing_agent = SummarizingAgent(self.llm_agent, debug=debug)
 
-        self.faq_min_score = int(faq_min_score)
-        self.enable_smart_routing = bool(enable_smart_routing)
-        self.enable_timing_logs = bool(enable_timing_logs)
-        self.debug = debug
+        # ── Tool Layer ────────────────────────────────────────────────────────
+        self.email_tool    = EmailDraftTool(self.llm_agent)
+        self.doc_tool      = DocumentGeneratorTool(self.llm_agent)
+        self.academic_tool = AcademicInfoTool()
+        self.response_log  = ResponseLogAgent(mongo_uri, db_name)
 
-    # ──────────────────────────────────────────────────────────────────────────
+        # ── Config ────────────────────────────────────────────────────────────
+        self.faq_min_score        = int(faq_min_score)
+        self.enable_smart_routing = bool(enable_smart_routing)
+        self.enable_timing_logs   = bool(enable_timing_logs)
+        self.debug                = debug
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Main Entry Point
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
 
     def answer(self, question: str) -> Dict[str, str]:
         question = (question or "").strip()
@@ -139,9 +241,176 @@ class OrchestratorAgent:
             return self._fallback()
 
         t0 = time.perf_counter()
+
+        # ── STEP 1: Intent Classification ─────────────────────────────────────
+        intent = self._classify_intent(question)
+        logger.info("🧠 Intent: %s | Query: '%s'", intent, question[:60])
+
+        # ── STEP 2: Route to correct pipeline ────────────────────────────────
+        if intent == INTENT_ACTION:
+            result = self._run_tool_pipeline(question)
+
+        elif intent == INTENT_HYBRID:
+            result = self._run_hybrid_pipeline(question)
+
+        else:
+            result = self._run_rag_pipeline(question, t0)
+
+        if result is None:
+            result = self._fallback()
+
+        # ── STEP 3: Log to MongoDB ─────────────────────────────────────────────
+        try:
+            self.response_log.log(
+                query=question,
+                answer=result.get("answer", ""),
+                source=result.get("source", "Unknown"),
+                intent_type=intent,
+                consistency_passed=str(result.get("consistency_passed", "true")).lower() == "true",
+                consistency_attempts=int(result.get("consistency_attempts", 0)),
+            )
+        except Exception as e:
+            logger.warning("Response log error: %s", e)
+
+        if self.enable_timing_logs:
+            logger.info("⏱ Total: %.3fs | Intent: %s", time.perf_counter() - t0, intent)
+
+        return result
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Intent Classifier
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _classify_intent(self, question: str) -> str:
+        """
+        Priority order: EMAIL > DOCUMENT > ACADEMIC_INFO > HYBRID > RAG
+        EMAIL and DOCUMENT are checked before HYBRID to avoid misclassification.
+        """
+        # Check email first — highest specificity
+        if _match(_EMAIL_PATTERNS, question):
+            return INTENT_ACTION
+
+        # Check document
+        if _match(_DOCUMENT_PATTERNS, question):
+            return INTENT_ACTION
+
+        # Check academic info (structured data)
+        if _match(_ACADEMIC_PATTERNS, question):
+            return INTENT_ACTION
+
+        # HYBRID: has an action word + a context bridge word
+        # e.g. "draft an email about scholarship eligibility" — caught above
+        # e.g. "write something about the admission process" — hybrid
+        action_words = {"draft", "write", "compose", "generate", "create", "make", "prepare"}
+        bridge_words = {"about", "regarding", "for", "related", "concerning", "on"}
+        tokens = set(question.lower().split())
+        if tokens & action_words and tokens & bridge_words:
+            return INTENT_HYBRID
+
+        return INTENT_RAG
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tool Pipeline  (ACTION intent)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_tool_pipeline(self, question: str) -> Dict[str, str]:
+        # 1. Email Draft Tool
+        if _match(_EMAIL_PATTERNS, question):
+            logger.info("🔧 Tool: EmailDraftTool")
+            try:
+                result = self.email_tool.draft(question)
+                return {
+                    "source": result.get("source", "Email Draft Tool"),
+                    "answer": result.get("answer", ""),
+                    "consistency_passed": "true",
+                    "consistency_attempts": "0",
+                }
+            except Exception as e:
+                logger.warning("EmailDraftTool error: %s", e)
+
+        # 2. Document Generator Tool
+        if _match(_DOCUMENT_PATTERNS, question):
+            logger.info("🔧 Tool: DocumentGeneratorTool")
+            try:
+                result = self.doc_tool.generate(question)
+                return {
+                    "source": result.get("source", "Document Generator Tool"),
+                    "answer": result.get("answer", ""),
+                    "consistency_passed": "true",
+                    "consistency_attempts": "0",
+                }
+            except Exception as e:
+                logger.warning("DocumentGeneratorTool error: %s", e)
+
+        # 3. Academic Info Tool
+        if _match(_ACADEMIC_PATTERNS, question):
+            logger.info("🔧 Tool: AcademicInfoTool")
+            try:
+                result = self.academic_tool.query(question)
+                return {
+                    "source": result.get("source", "Academic Info Tool"),
+                    "answer": result.get("answer", ""),
+                    "consistency_passed": "true",
+                    "consistency_attempts": "0",
+                }
+            except Exception as e:
+                logger.warning("AcademicInfoTool error: %s", e)
+
+        # Fallback to RAG if tool fails
+        logger.warning("Tool pipeline had no match — falling back to RAG")
+        return self._run_rag_pipeline(question, time.perf_counter())
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Hybrid Pipeline  (HYBRID intent)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_hybrid_pipeline(self, question: str) -> Dict[str, str]:
+        """Fetch RAG context first, then invoke tool with enriched request."""
+        logger.info("🔀 Hybrid pipeline started")
+        try:
+            # Fetch top-2 context chunks
+            chunks = self._run_retriever("VECTOR", question) or \
+                     self._run_retriever("WEB", question) or []
+            context = "\n\n".join(chunks[:2]) if chunks else ""
+
+            enriched = question
+            if context:
+                enriched = f"{question}\n\nContext:\n{context}"
+
+            # Try email tool with enriched context
+            if _match(_EMAIL_PATTERNS, question):
+                result = self.email_tool.draft(enriched)
+                return {
+                    "source": "Hybrid: Email Draft Tool",
+                    "answer": result.get("answer", ""),
+                    "consistency_passed": "true",
+                    "consistency_attempts": "0",
+                }
+
+            # Try document tool with enriched context
+            if _match(_DOCUMENT_PATTERNS, question):
+                result = self.doc_tool.generate(enriched)
+                return {
+                    "source": "Hybrid: Document Generator Tool",
+                    "answer": result.get("answer", ""),
+                    "consistency_passed": "true",
+                    "consistency_attempts": "0",
+                }
+
+        except Exception as e:
+            logger.warning("Hybrid pipeline error: %s", e)
+
+        # Fallback to RAG
+        return self._run_rag_pipeline(question, time.perf_counter())
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # RAG Pipeline  (RAG intent — original 8-step flow preserved exactly)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_rag_pipeline(self, question: str, t0: float) -> Dict[str, str]:
         timings: Dict[str, float] = {}
 
-        # Step 1: FAQ (fast path)
+        # Step 1: FAQ fast path
         faq_result = self._timed("FAQ", timings, lambda: self._run_faq(question))
         if faq_result is not None:
             faq_result["answer"] = self._append_links(
@@ -151,7 +420,7 @@ class OrchestratorAgent:
                 self._log(["FAQ"], timings, time.perf_counter() - t0, "FAQ")
             return faq_result
 
-        # Step 2: Retrieve chunks
+        # Step 2: Smart routing
         order = self._decide_order(question)
         chunk: Optional[List[str]] = None
         chunk_source: Optional[str] = None
@@ -172,7 +441,7 @@ class OrchestratorAgent:
                 self._log(order, timings, time.perf_counter() - t0, "Fallback")
             return self._fallback()
 
-        # Step 3: Extract URLs + strip Source: lines before LLM
+        # Step 3: Extract URLs + strip Source: lines
         source_urls = self._extract_source_urls(chunk)
         clean_chunk = self._strip_source_lines(chunk)
 
@@ -218,9 +487,9 @@ class OrchestratorAgent:
             "consistency_attempts": str(attempts),
         }
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Retrieval Runners
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Retrieval Runners (unchanged from original)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _run_faq(self, question: str) -> Optional[Dict[str, str]]:
         try:
@@ -253,12 +522,11 @@ class OrchestratorAgent:
             logger.warning("%s retriever error: %s", name, e)
         return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # URL Extraction & Link Appending
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # URL Extraction & Link Appending (unchanged from original)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _extract_source_urls(self, chunks: List[str]) -> List[str]:
-        """Extract Source: URLs embedded by the web scraper in chunks."""
         urls: List[str] = []
         seen: set = set()
         for chunk in chunks:
@@ -274,7 +542,6 @@ class OrchestratorAgent:
         return urls
 
     def _strip_source_lines(self, chunks: List[str]) -> List[str]:
-        """Remove Source: lines before feeding to LLM — they confuse the model."""
         cleaned: List[str] = []
         for chunk in chunks:
             kept = [
@@ -305,13 +572,6 @@ class OrchestratorAgent:
         source_urls: List[str],
         chunk_source: Optional[str],
     ) -> str:
-        """Appends relevant KIET links to the bottom of the answer.
-
-        Priority:
-          1. Real URLs scraped directly from KIET pages (WEB agent)
-          2. Curated fallback links matched by question keywords
-          3. No links if not link-worthy or answer is error/fallback
-        """
         if not self._is_link_worthy(question):
             return answer
         if "contact the University directly" in answer:
@@ -336,9 +596,9 @@ class OrchestratorAgent:
             return answer + "\n" + "\n".join(link_lines)
         return answer
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # FAQ Storage
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # FAQ Storage (unchanged from original)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _store_to_faq(self, question: str, answer: str) -> None:
         if not question or not answer:
@@ -366,9 +626,9 @@ class OrchestratorAgent:
         except Exception as e:
             logger.warning("FAQ store error: %s", e)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Smart Routing
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Smart Routing (unchanged from original)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _decide_order(self, question: str) -> List[str]:
         base = ["FAQ", "VECTOR", "WEB"]
@@ -406,9 +666,9 @@ class OrchestratorAgent:
 
         return base
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ──────────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Helpers (unchanged from original)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _timed(self, name: str, timings: dict, fn):
         start = time.perf_counter()
@@ -434,5 +694,9 @@ class OrchestratorAgent:
     def close(self) -> None:
         try:
             self.faq_agent.close()
+        except Exception:
+            pass
+        try:
+            self.response_log.close()
         except Exception:
             pass
